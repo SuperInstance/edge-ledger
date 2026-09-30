@@ -1,0 +1,16 @@
+name: build-and-test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # No package.json by design ("No dependencies. Node >= 18" — README), so there
+      # is nothing to npm-install or build; the suite is the README's documented pin
+      # run. History-independent: passes identically on shallow and full checkouts.
+      - run: node --test test/edge.pins.mjs
