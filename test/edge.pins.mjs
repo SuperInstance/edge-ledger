@@ -10,6 +10,7 @@ import { seal, verifyChain, verifySig, canonical, sha256 } from "../src/envelope
 import { EnvelopeStore } from "../src/store.mjs";
 import { fleetBoard, boardHash } from "../src/projection.mjs";
 import { createHash } from "node:crypto";
+import { merkleRoot, inclusionProof, verifyProof, EMPTY_ROOT } from "../src/merkle.mjs";
 
 const KEY = { key: "edge-test-key-outside-the-process" };
 const stable = (o) => {
@@ -100,4 +101,53 @@ test("E5 receipt-batch carries quilt/cell-receipt@v1 verbatim; local re-verify g
   const r = store.ingest(bad, { key: KEY.key, receiptCheck });
   assert.equal(r.ok, false);
   assert.match(r.why, /receipt-batch rejected/);
+});
+
+// --- frontier shard: Merkle receipt batches (PAM arXiv 2605.11032 inspired) ---
+
+test("E6 merkleRoot is deterministic with pinned edge cases", () => {
+  const leaves = ["aa".repeat(32), "bb".repeat(32), "cc".repeat(32), "dd".repeat(32)];
+  assert.equal(merkleRoot([]), EMPTY_ROOT);
+  assert.equal(merkleRoot(["aa".repeat(32)]), "aa".repeat(32), "single leaf IS the root");
+  assert.equal(merkleRoot(leaves), merkleRoot([...leaves]), "deterministic");
+  assert.notEqual(merkleRoot(leaves), merkleRoot([leaves[1], leaves[0], leaves[2], leaves[3]]), "order matters");
+});
+
+test("E7 inclusion proofs verify for every leaf of an odd tree; tampering fails", () => {
+  const leaves = Array.from({ length: 5 }, (_, i) => createHash("sha256").update(`leaf${i}`).digest("hex"));
+  const root = merkleRoot(leaves);
+  for (let i = 0; i < 5; i++) {
+    const p = inclusionProof(leaves, i);
+    assert.ok(verifyProof(root, leaves[i], p), `leaf ${i} proves against the root`);
+    assert.ok(p.length <= 3, `leaf ${i}: O(log n) proof size (${p.length} steps for n=5)`);
+  }
+  const forged = createHash("sha256").update("leaf9").digest("hex");
+  assert.equal(verifyProof(root, forged, inclusionProof(leaves, 2)), false, "foreign leaf fails");
+  const good = inclusionProof(leaves, 1);
+  good[0].sibling = good[0].sibling.replace(/^../, "ff");
+  assert.equal(verifyProof(root, leaves[1], good), false, "spliced proof fails");
+});
+
+test("E8 sealed envelope with merkle_root: ingest gates on it; selective disclosure verifies against the sealed root", () => {
+  const mk = (op, addr, result, parent) => ({
+    schema: "quilt/cell-receipt@v1",
+    receipt_id: localReceiptId(op, addr, result, parent),
+    parent, op, addr, result,
+  });
+  const rs = [];
+  let parent = null;
+  for (let i = 0; i < 6; i++) { const r = mk("TICK", `C${i}`, { n: i }, parent); rs.push(r); parent = r.receipt_id; }
+  const root = merkleRoot(rs.map((r) => r.receipt_id));
+  const store = new EnvelopeStore();
+  const good = seal({ node: "gpu-lane", seq: 1, kind: "receipt-batch", payload: { schema: "quilt/cell-receipt@v1", merkle_root: root, receipts: rs }, signer: KEY });
+  assert.equal(store.ingest(good, { key: KEY.key }).ok, true);
+  // selective disclosure: a consumer gets leaf #4 + its proof — NOT the batch
+  const leaf4 = rs[4].receipt_id;
+  const proof4 = inclusionProof(rs.map((r) => r.receipt_id), 4);
+  assert.ok(verifyProof(good.payload.merkle_root, leaf4, proof4), "one leaf + O(log n) bytes proves membership in the sealed batch");
+  // a lying batch: swapped receipts under a root computed for the true set
+  const lying = seal({ node: "gpu-lane", seq: 2, prevEnv: good, kind: "receipt-batch", payload: { schema: "quilt/cell-receipt@v1", merkle_root: root, receipts: [rs[0], rs[1], rs[2], rs[3], rs[5], rs[4]] }, signer: KEY });
+  const r = store.ingest(lying, { key: KEY.key });
+  assert.equal(r.ok, false);
+  assert.match(r.why, /merkle_root mismatch/);
 });

@@ -2,6 +2,7 @@
 // envelope, idempotent acks, forks rejected loudly. A JSONL file is the
 // reference substrate; the schema binds rows, not the engine underneath.
 import { canonical, sha256, verifyChain, verifySig, SCHEMA } from "./envelope.mjs";
+import { merkleRoot } from "./merkle.mjs";
 import { appendFileSync, readFileSync } from "node:fs";
 
 export class EnvelopeStore {
@@ -40,9 +41,16 @@ export class EnvelopeStore {
     if (tip && env.prev !== sha256(canonical(tip))) return { ok: false, why: "prev does not match stored tip" };
     const sig = verifySig(env, key);
     if (!sig.ok) return { ok: false, why: sig.why };
-    if (env.kind === "receipt-batch" && receiptCheck) {
-      const chk = receiptCheck(env.payload);
-      if (!chk.ok) return { ok: false, why: `receipt-batch rejected: ${chk.why}` };
+    if (env.kind === "receipt-batch") {
+      if (receiptCheck) {
+        const chk = receiptCheck(env.payload);
+        if (!chk.ok) return { ok: false, why: `receipt-batch rejected: ${chk.why}` };
+      }
+      if (env.payload.merkle_root) { // frontier (PAM-inspired): batch root must match the receipts carried
+        const want = merkleRoot(env.payload.receipts.map((r) => r.receipt_id));
+        if (want !== env.payload.merkle_root)
+          return { ok: false, why: `merkle_root mismatch: envelope claims ${env.payload.merkle_root.slice(0, 12)}, receipts hash to ${want.slice(0, 12)}` };
+      }
     }
     if (!this.rows.has(env.node)) this.rows.set(env.node, []);
     this.rows.get(env.node).push(env);
